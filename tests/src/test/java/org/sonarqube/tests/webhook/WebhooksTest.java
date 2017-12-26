@@ -37,19 +37,22 @@ import org.sonarqube.tests.Category3Suite;
 import org.sonarqube.ws.Issues.Issue;
 import org.sonarqube.ws.Organizations.Organization;
 import org.sonarqube.ws.Projects.CreateWsResponse.Project;
+import org.sonarqube.ws.Qualitygates;
 import org.sonarqube.ws.Qualityprofiles.CreateWsResponse.QualityProfile;
 import org.sonarqube.ws.Webhooks;
 import org.sonarqube.ws.client.HttpException;
 import org.sonarqube.ws.client.WsClient;
+import org.sonarqube.ws.client.issues.BulkChangeRequest;
 import org.sonarqube.ws.client.issues.SearchRequest;
-import org.sonarqube.ws.client.issues.SetSeverityRequest;
 import org.sonarqube.ws.client.projects.DeleteRequest;
+import org.sonarqube.ws.client.qualitygates.CreateConditionRequest;
 import org.sonarqube.ws.client.settings.ResetRequest;
 import org.sonarqube.ws.client.settings.SetRequest;
 import org.sonarqube.ws.client.webhooks.DeliveriesRequest;
 import org.sonarqube.ws.client.webhooks.DeliveryRequest;
 import util.ItUtils;
 
+import static java.util.Collections.singletonList;
 import static java.util.Objects.requireNonNull;
 import static java.util.stream.IntStream.range;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -230,20 +233,29 @@ public class WebhooksTest {
     Organization defaultOrganization = tester.organizations().getDefaultOrganization();
     Project wsProject = tester.projects().provision(r -> r.setProject(PROJECT_KEY).setName(PROJECT_NAME));
     enableProjectWebhooks(PROJECT_KEY, new Webhook("Burgr", externalServer.urlFor("/burgr")));
+    // quality profile with one issue per line
     QualityProfile qualityProfile = tester.qProfiles().createXooProfile(defaultOrganization);
     tester.qProfiles().activateRule(qualityProfile, "xoo:OneIssuePerLine");
     tester.qProfiles().assignQProfileToProject(qualityProfile, wsProject);
-
+    // quality gate definition
+    Qualitygates.CreateResponse qGate = tester.qGates().generate();
+    tester.qGates().service().createCondition(new CreateConditionRequest().setGateId(String.valueOf(qGate.getId()))
+      .setMetric("reliability_rating").setOp("GT").setError("1"));
+    tester.qGates().associateProject(qGate, wsProject);
+    // analyze project and clear first webhook
     analyseProject();
     waitUntilAllWebHooksCalled(1);
     externalServer.clear();
-    Issue firstIssue = tester.wsClient().issues().search(new SearchRequest()).getIssues(0);
-    tester.wsClient().issues().setSeverity(new SetSeverityRequest().setIssue(firstIssue.getKey()).setSeverity("INFO"));
 
+    // change an issue to blocker bug
+    Issue firstIssue = tester.wsClient().issues().search(new SearchRequest()).getIssues(0);
+    tester.wsClient().issues().bulkChange(new BulkChangeRequest().setIssues(singletonList(firstIssue.getKey()))
+      .setSetSeverity(singletonList("BLOCKER"))
+      .setSetType(singletonList("BUG")));
     waitUntilAllWebHooksCalled(1);
+
     PayloadRequest request = externalServer.getPayloadRequests().get(0);
     assertThat(request.getHttpHeaders().get("X-SonarQube-Project")).isEqualTo(PROJECT_KEY);
-
     // verify content of payload
     Map<String, Object> payload = jsonToMap(request.getJson());
     assertThat(payload.get("status")).isEqualTo("SUCCESS");
@@ -253,7 +265,7 @@ public class WebhooksTest {
     assertThat(project.get("name")).isEqualTo(PROJECT_NAME);
     assertThat(project.get("url")).isEqualTo(orchestrator.getServer().getUrl() + "/dashboard?id=" + PROJECT_KEY);
     Map<String, Object> gate = (Map<String, Object>) payload.get("qualityGate");
-    assertThat(gate.get("name")).isEqualTo("Sonar way");
+    assertThat(gate.get("name")).isEqualTo(qGate.getName());
     assertThat(gate.get("status")).isEqualTo("ERROR");
     assertThat(gate.get("conditions")).isNotNull();
   }
